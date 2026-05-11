@@ -1,13 +1,20 @@
+import argparse
 import os
 import sys
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
+import holidays
 import requests
 import yfinance as yf
 
 
-TICKER = "^GSPC"
+TICKER = "360750.KS"
+ASSET_NAME = "TIGER 미국S&P500"
 BASE_AMOUNT = 1_000_000
+PAYDAY_DAY = 25
+KST = ZoneInfo("Asia/Seoul")
 
 # 큰 하락률부터 판단해야 -12% 이하일 때 500만원이 정확히 선택된다.
 INVESTMENT_RULES = [
@@ -18,11 +25,18 @@ INVESTMENT_RULES = [
 
 
 @dataclass
+class PricePoint:
+    close_date: date
+    close_price: float
+
+
+@dataclass
 class MonthlyResult:
-    previous_close: float
-    latest_close: float
+    previous: PricePoint
+    latest: PricePoint
     monthly_return: float
     investment_amount: int
+    payday: date
 
 
 def get_required_env(name: str) -> str:
@@ -32,18 +46,41 @@ def get_required_env(name: str) -> str:
     return value
 
 
-def fetch_monthly_closes() -> tuple[float, float]:
-    """S&P500 월봉 데이터를 가져와 최근 2개 월 종가를 반환한다."""
-    data = yf.download(
-        TICKER,
-        period="6mo",
-        interval="1mo",
-        auto_adjust=True,
-        progress=False,
-    )
+def is_korean_holiday(day: date) -> bool:
+    korean_holidays = holidays.country_holidays("KR", years=[day.year])
+    return day in korean_holidays
 
+
+def is_business_day(day: date) -> bool:
+    return day.weekday() < 5 and not is_korean_holiday(day)
+
+
+def previous_non_holiday_friday(day: date) -> date:
+    friday = day - timedelta(days=(day.weekday() - 4) % 7)
+    if friday >= day:
+        friday -= timedelta(days=7)
+
+    while is_korean_holiday(friday):
+        friday -= timedelta(days=7)
+
+    return friday
+
+
+def get_payday(today: date) -> date:
+    scheduled_day = date(today.year, today.month, PAYDAY_DAY)
+    if is_business_day(scheduled_day):
+        return scheduled_day
+
+    return previous_non_holiday_friday(scheduled_day)
+
+
+def should_send_today(today: date) -> bool:
+    return today == get_payday(today)
+
+
+def get_close_series(data):
     if data.empty or "Close" not in data:
-        raise RuntimeError("S&P500 월별 종가 데이터를 가져오지 못했습니다.")
+        raise RuntimeError(f"{ASSET_NAME}({TICKER}) 종가 데이터를 가져오지 못했습니다.")
 
     close_data = data["Close"]
     if hasattr(close_data, "ndim") and close_data.ndim == 2:
@@ -51,29 +88,54 @@ def fetch_monthly_closes() -> tuple[float, float]:
 
     closes = close_data.dropna()
     if len(closes) < 2:
-        raise RuntimeError("월간 수익률 계산에 필요한 종가 데이터가 부족합니다.")
+        raise RuntimeError("수익률 계산에 필요한 종가 데이터가 부족합니다.")
 
-    return float(closes.iloc[-2]), float(closes.iloc[-1])
+    return closes
+
+
+def fetch_price_points() -> tuple[PricePoint, PricePoint]:
+    data = yf.download(
+        TICKER,
+        period="6mo",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+    closes = get_close_series(data)
+
+    latest_timestamp = closes.index[-1]
+    latest_date = latest_timestamp.date()
+    latest = PricePoint(latest_date, float(closes.iloc[-1]))
+
+    first_day_of_latest_month = latest_date.replace(day=1)
+    previous_month_closes = closes[closes.index.date < first_day_of_latest_month]
+    if previous_month_closes.empty:
+        raise RuntimeError("전월 마지막 거래일 종가를 찾지 못했습니다.")
+
+    previous_timestamp = previous_month_closes.index[-1]
+    previous = PricePoint(previous_timestamp.date(), float(previous_month_closes.iloc[-1]))
+
+    return previous, latest
 
 
 def decide_investment_amount(monthly_return: float) -> int:
-    """월간 하락률에 따라 이번 달 투자금을 결정한다."""
     for trigger_rate, amount in INVESTMENT_RULES:
         if monthly_return <= trigger_rate:
             return amount
     return BASE_AMOUNT
 
 
-def calculate_monthly_result() -> MonthlyResult:
-    previous_close, latest_close = fetch_monthly_closes()
-    monthly_return = (latest_close / previous_close - 1) * 100
+def calculate_monthly_result(today: date) -> MonthlyResult:
+    previous, latest = fetch_price_points()
+    monthly_return = (latest.close_price / previous.close_price - 1) * 100
     investment_amount = decide_investment_amount(monthly_return)
 
     return MonthlyResult(
-        previous_close=previous_close,
-        latest_close=latest_close,
+        previous=previous,
+        latest=latest,
         monthly_return=monthly_return,
         investment_amount=investment_amount,
+        payday=get_payday(today),
     )
 
 
@@ -81,11 +143,22 @@ def format_won(amount: int) -> str:
     return f"{amount:,}원"
 
 
+def format_price(price: float) -> str:
+    return f"{price:,.0f}원"
+
+
+def format_close_time(close_date: date) -> str:
+    return f"{close_date:%Y-%m-%d} 15:30 KST 기준"
+
+
 def build_alert_message(result: MonthlyResult) -> str:
     return (
-        "S&P500 월간 투자 알림\n\n"
-        f"이전 월 종가: {result.previous_close:,.2f}\n"
-        f"최근 월 종가: {result.latest_close:,.2f}\n\n"
+        f"{ASSET_NAME} 월급날 투자 알림\n\n"
+        f"월급 지급일: {result.payday:%Y-%m-%d} 09:00 KST\n\n"
+        f"이전 월 종가: {format_price(result.previous.close_price)}\n"
+        f"기준 시각: {format_close_time(result.previous.close_date)}\n\n"
+        f"최근 종가: {format_price(result.latest.close_price)}\n"
+        f"기준 시각: {format_close_time(result.latest.close_date)}\n\n"
         f"월간 변화율: {result.monthly_return:.2f}%\n\n"
         "투자 기준:\n"
         "- 평상시: 1,000,000원\n"
@@ -96,9 +169,14 @@ def build_alert_message(result: MonthlyResult) -> str:
     )
 
 
+def build_skip_message(today: date) -> str:
+    payday = get_payday(today)
+    return f"오늘({today:%Y-%m-%d})은 알림일이 아닙니다. 이번 달 알림일: {payday:%Y-%m-%d}"
+
+
 def build_error_message(error: Exception) -> str:
     return (
-        "S&P500 월간 투자 알림 오류\n\n"
+        f"{ASSET_NAME} 월급날 투자 알림 오류\n\n"
         f"오류 내용: {error}"
     )
 
@@ -118,15 +196,41 @@ def send_telegram(message: str) -> None:
     response.raise_for_status()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=f"{ASSET_NAME} 월급날 투자 알림")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="월급 지급일 여부와 상관없이 알림을 보냅니다.",
+    )
+    parser.add_argument(
+        "--date",
+        help="테스트용 실행 날짜입니다. 예: 2026-05-25",
+    )
+    return parser.parse_args()
+
+
+def resolve_today(date_text: str | None) -> date:
+    if date_text:
+        return datetime.strptime(date_text, "%Y-%m-%d").date()
+    return datetime.now(KST).date()
+
+
 def main() -> int:
+    args = parse_args()
+    today = resolve_today(args.date)
+
+    if not args.force and not should_send_today(today):
+        print(build_skip_message(today))
+        return 0
+
     try:
-        result = calculate_monthly_result()
+        result = calculate_monthly_result(today)
         send_telegram(build_alert_message(result))
         return 0
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
 
-        # 텔레그램 설정 자체가 문제인 경우에는 콘솔 오류만 남긴다.
         try:
             send_telegram(build_error_message(error))
         except Exception as telegram_error:
