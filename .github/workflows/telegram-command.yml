@@ -1,14 +1,14 @@
-name: S&P500 Monthly Alert
+name: Telegram Command Poller
 
 on:
   schedule:
-    # Weekdays UTC 00:00 and 00:05 = Korea Standard Time 09:00 and 09:05.
-    # The script decides whether today is the monthly payday alert date.
-    - cron: "0,5 0 * * 1-5"
+    # GitHub Actions cannot receive Telegram messages instantly without a server.
+    # This checks for the "1" command every 5 minutes.
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
-  run-alert:
+  poll-telegram:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,13 +23,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run alert script
+      - name: Poll Telegram commands
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            python sp500_alert.py --force
-          else
-            python sp500_alert.py
-          fi
+        run: python sp500_alert.py --poll-telegram
