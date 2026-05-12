@@ -12,6 +12,7 @@ import yfinance as yf
 
 BASE_AMOUNT = 1_000_000
 PAYDAY_DAY = 25
+INVESTMENT_DAY = 25
 KST = ZoneInfo("Asia/Seoul")
 
 # 큰 하락률부터 판단해야 -12% 이하일 때 500만원이 정확히 선택된다.
@@ -40,9 +41,9 @@ class PricePoint:
 @dataclass(frozen=True)
 class AssetResult:
     asset: Asset
-    previous: PricePoint
+    base: PricePoint
     latest: PricePoint
-    monthly_return: float
+    return_pct: float
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class AlertResult:
     tiger: AssetResult
     investment_amount: int
     payday: date
+    investment_day: int
+    target_base_date: date
     generated_at: datetime
 
 
@@ -99,9 +102,36 @@ def should_send_today(today: date) -> bool:
     return today == get_payday(today)
 
 
+def add_months(day: date, months: int) -> date:
+    month_index = day.month - 1 + months
+    year = day.year + month_index // 12
+    month = month_index % 12 + 1
+    return date(year, month, min(day.day, 28))
+
+
+def get_previous_investment_date(current_date: date, investment_day: int) -> date:
+    """실행일 기준 직전 투자 기준일을 반환한다.
+
+    투자 기준일 당일에는 아직 이번 달 종가가 확정되지 않았다고 보고,
+    전월 투자 기준일을 비교 기준으로 사용한다.
+    """
+    current_month_investment_date = date(current_date.year, current_date.month, investment_day)
+    if current_date > current_month_investment_date:
+        return current_month_investment_date
+
+    previous_month = add_months(current_month_investment_date, -1)
+    return date(previous_month.year, previous_month.month, investment_day)
+
+
+def calculate_return(base_price: float, current_price: float) -> float:
+    if base_price <= 0:
+        raise RuntimeError("기준 종가가 0 이하라 수익률을 계산할 수 없습니다.")
+    return (current_price / base_price - 1) * 100
+
+
 def get_close_series(data, asset: Asset):
     if data.empty or "Close" not in data:
-        raise RuntimeError(f"{asset.name}({asset.ticker}) 종가 데이터를 가져오지 못했습니다.")
+        raise RuntimeError(f"{asset.name}({asset.ticker}) 데이터 조회 실패: 종가 데이터가 없습니다.")
 
     close_data = data["Close"]
     if hasattr(close_data, "ndim") and close_data.ndim == 2:
@@ -109,58 +139,70 @@ def get_close_series(data, asset: Asset):
 
     closes = close_data.dropna()
     if len(closes) < 2:
-        raise RuntimeError(f"{asset.name} 수익률 계산에 필요한 종가 데이터가 부족합니다.")
+        raise RuntimeError(f"{asset.name} 데이터 조회 실패: 종가 데이터가 부족합니다.")
 
     return closes
 
 
-def fetch_asset_result(asset: Asset) -> AssetResult:
+def get_nearest_previous_trading_close(closes, target_date: date, label: str) -> PricePoint:
+    """target_date 당일 또는 그 이전의 가장 가까운 거래일 종가를 찾는다."""
+    filtered = closes[closes.index.date <= target_date]
+    if filtered.empty:
+        raise RuntimeError(f"{label} 가격 데이터를 찾지 못했습니다. 기준일: {target_date:%Y-%m-%d}")
+
+    timestamp = filtered.index[-1]
+    return PricePoint(timestamp.date(), float(filtered.iloc[-1]))
+
+
+def fetch_asset_result(asset: Asset, current_date: date, investment_day: int) -> AssetResult:
     data = yf.download(
         asset.ticker,
-        period="6mo",
+        period="1y",
         interval="1d",
         auto_adjust=True,
         progress=False,
     )
     closes = get_close_series(data, asset)
 
-    latest_timestamp = closes.index[-1]
-    latest_date = latest_timestamp.date()
-    latest = PricePoint(latest_date, float(closes.iloc[-1]))
-
-    first_day_of_latest_month = latest_date.replace(day=1)
-    previous_month_closes = closes[closes.index.date < first_day_of_latest_month]
-    if previous_month_closes.empty:
-        raise RuntimeError(f"{asset.name} 전월 마지막 거래일 종가를 찾지 못했습니다.")
-
-    previous_timestamp = previous_month_closes.index[-1]
-    previous = PricePoint(previous_timestamp.date(), float(previous_month_closes.iloc[-1]))
-    monthly_return = (latest.close_price / previous.close_price - 1) * 100
+    target_base_date = get_previous_investment_date(current_date, investment_day)
+    base = get_nearest_previous_trading_close(
+        closes,
+        target_base_date,
+        f"{asset.name} 이전 투자 기준 종가",
+    )
+    latest = get_nearest_previous_trading_close(
+        closes,
+        current_date,
+        f"{asset.name} 최근 종가",
+    )
+    return_pct = calculate_return(base.close_price, latest.close_price)
 
     return AssetResult(
         asset=asset,
-        previous=previous,
+        base=base,
         latest=latest,
-        monthly_return=monthly_return,
+        return_pct=return_pct,
     )
 
 
-def decide_investment_amount(monthly_return: float) -> int:
+def decide_investment_amount(return_pct: float) -> int:
     for trigger_rate, amount in INVESTMENT_RULES:
-        if monthly_return <= trigger_rate:
+        if return_pct <= trigger_rate:
             return amount
     return BASE_AMOUNT
 
 
 def calculate_alert_result(today: date) -> AlertResult:
-    sp500 = fetch_asset_result(ASSETS[0])
-    tiger = fetch_asset_result(ASSETS[1])
+    sp500 = fetch_asset_result(ASSETS[0], today, INVESTMENT_DAY)
+    tiger = fetch_asset_result(ASSETS[1], today, INVESTMENT_DAY)
 
     return AlertResult(
         sp500=sp500,
         tiger=tiger,
-        investment_amount=decide_investment_amount(tiger.monthly_return),
+        investment_amount=decide_investment_amount(tiger.return_pct),
         payday=get_payday(today),
+        investment_day=INVESTMENT_DAY,
+        target_base_date=get_previous_investment_date(today, INVESTMENT_DAY),
         generated_at=datetime.now(KST),
     )
 
@@ -181,11 +223,11 @@ def format_close_time(result: AssetResult, close_date: date) -> str:
 def build_asset_section(result: AssetResult) -> str:
     return (
         f"[{result.asset.name}]\n"
-        f"이전 월 종가: {format_price(result, result.previous.close_price)}\n"
-        f"이전 월 기준: {format_close_time(result, result.previous.close_date)}\n"
+        f"이전 투자 기준 종가: {format_price(result, result.base.close_price)}\n"
+        f"이전 투자 기준: {format_close_time(result, result.base.close_date)}\n"
         f"최근 종가: {format_price(result, result.latest.close_price)}\n"
         f"최근 기준: {format_close_time(result, result.latest.close_date)}\n"
-        f"월간 변화율: {result.monthly_return:.2f}%"
+        f"투자 기준일 대비 변화율: {result.return_pct:.2f}%"
     )
 
 
@@ -193,15 +235,18 @@ def build_alert_message(result: AlertResult, title: str = "월급날 투자 알�
     return (
         f"{title}\n\n"
         f"생성 시각: {result.generated_at:%Y-%m-%d %H:%M KST}\n"
-        f"월급 지급일: {result.payday:%Y-%m-%d} 09:00 / 09:05 KST\n\n"
+        f"투자 기준일: 매월 {result.investment_day}일\n"
+        f"월급 지급일: {result.payday:%Y-%m-%d} 09:00 / 09:05 KST\n"
+        f"실제 비교 기준일: {format_close_time(result.tiger, result.tiger.base.close_date)}\n"
+        f"최근 기준일: {format_close_time(result.tiger, result.tiger.latest.close_date)}\n\n"
         f"{build_asset_section(result.sp500)}\n\n"
         f"{build_asset_section(result.tiger)}\n\n"
-        "투자금 판단 기준: TIGER 미국S&P500 월간 변화율\n"
+        "투자금 판단 기준: TIGER 미국S&P500 투자 기준일 대비 변화율\n\n"
         "투자 기준:\n"
         "- 평상시: 1,000,000원\n"
-        "- 월간 -3% 이하: 2,000,000원\n"
-        "- 월간 -7% 이하: 3,000,000원\n"
-        "- 월간 -12% 이하: 5,000,000원\n\n"
+        "- -3% 이하: 2,000,000원\n"
+        "- -7% 이하: 3,000,000원\n"
+        "- -12% 이하: 5,000,000원\n\n"
         f"이번 달 매수금액: {format_won(result.investment_amount)}"
     )
 
