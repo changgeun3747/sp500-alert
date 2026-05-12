@@ -1,0 +1,13 @@
+{
+  "name": "sp500-alert-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "set-webhook": "node set-webhook.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.14.4"
+  }
+}
